@@ -3457,6 +3457,56 @@
         const configNodesOfflineAgeInSeconds = getConfigNodesOfflineAgeInSeconds();
         const configNeighboursMaxDistanceInMeters = getConfigNeighboursMaxDistanceInMeters();
 
+        // build a map of coordinates to detect duplicates
+        // this helps us apply jitter to nodes at the same location.
+        // note: node.latitude/longitude are still in raw integer form (degrees * 1e7)
+        // at this point, because the main loop below hasn't normalised them yet.
+        const coordinateMap = new Map();
+        for(const node of updatedNodes){
+            if(!node.latitude || !node.longitude){
+                continue;
+            }
+            const lat = node.latitude / 10000000;
+            const lng = node.longitude / 10000000;
+            if(!isValidLatLng(lat, lng)){
+                continue;
+            }
+            const coordKey = `${lat.toFixed(7)},${lng.toFixed(7)}`;
+            if(!coordinateMap.has(coordKey)){
+                coordinateMap.set(coordKey, []);
+            }
+            coordinateMap.get(coordKey).push(node);
+        }
+
+        // function to apply jitter to node coordinates when there are duplicates.
+        // expects lat/lng already normalised to decimal degrees.
+        function getAdjustedCoordinates(node, lat, lng, coordinateMap) {
+
+            const coordKey = `${lat.toFixed(7)},${lng.toFixed(7)}`;
+            const nodesAtCoord = coordinateMap.get(coordKey) || [];
+
+            // if only one node at this coordinate, return as-is
+            if(nodesAtCoord.length <= 1){
+                return {latitude: lat, longitude: lng};
+            }
+
+            // apply jitter for nodes at duplicate coordinates
+            // find the index of this node among others at same location
+            const nodeIndex = nodesAtCoord.findIndex(n => n.node_id === node.node_id);
+
+            // calculate angle and distance for radial distribution
+            const anglePerNode = (Math.PI * 2) / nodesAtCoord.length;
+            const angle = anglePerNode * nodeIndex;
+
+            // jitter distance in degrees (approximately 10-15 meters depending on latitude)
+            const jitterDistance = 0.0001;
+
+            const adjustedLat = lat + (Math.cos(angle) * jitterDistance);
+            const adjustedLng = lng + (Math.sin(angle) * jitterDistance);
+
+            return {latitude: adjustedLat, longitude: adjustedLng};
+        }
+
         // add nodes
         for(const node of updatedNodes){
 
@@ -3485,8 +3535,10 @@
                 continue;
             }
 
-            // use longitude as-is
-            var longitude = parseFloat(node.longitude);
+            // get adjusted coordinates to handle duplicate locations
+            const adjustedCoords = getAdjustedCoordinates(node, node.latitude, node.longitude, coordinateMap);
+            const markerLatitude = adjustedCoords.latitude;
+            const markerLongitude = adjustedCoords.longitude;
 
             // icon based on mqtt connection state
             var icon = iconMqttDisconnected;
@@ -3506,7 +3558,7 @@
             }
 
             // create node marker
-            const marker = L.marker([node.latitude, longitude], {
+            const marker = L.marker([markerLatitude, markerLongitude], {
                 icon: icon,
                 tagName: node.node_id,
                 // we want to show online nodes above offline, but without needing to use separate layer groups
