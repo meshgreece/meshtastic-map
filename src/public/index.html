@@ -59,24 +59,28 @@
             background-color: #16a34a;
             border-radius: 25px;
             border: 1px solid white;
+            box-shadow: 0 0 0 2px #fff, 0 0 0 3px rgba(0, 0, 0, 0.18), 0 1px 3px rgba(0, 0, 0, 0.4);
         }
 
         .icon-mqtt-disconnected {
             background-color: #2563eb;
             border-radius: 25px;
             border: 1px solid white;
+            box-shadow: 0 0 0 2px #fff, 0 0 0 3px rgba(0, 0, 0, 0.18), 0 1px 3px rgba(0, 0, 0, 0.4);
         }
 
         .icon-offline {
             background-color: #dc2626;
             border-radius: 25px;
             border: 1px solid white;
+            box-shadow: 0 0 0 2px #fff, 0 0 0 3px rgba(0, 0, 0, 0.18), 0 1px 3px rgba(0, 0, 0, 0.4);
         }
 
         .icon-position-history {
             background-color: #a855f7;
             border-radius: 25px;
             border: 1px solid white;
+            box-shadow: 0 0 0 2px #fff, 0 0 0 3px rgba(0, 0, 0, 0.18), 0 1px 3px rgba(0, 0, 0, 0.4);
         }
 
         .waypoint-label {
@@ -2826,28 +2830,119 @@
     var nodePositionHistoryLayerGroup = new L.LayerGroup();
 
     // create icons
-    var iconMqttConnected = L.divIcon({
-        className: 'icon-mqtt-connected',
-        iconSize: [16, 16], // increase from 12px to 16px to make hover easier
-    });
-
-    var iconMqttDisconnected = L.divIcon({
-        className: 'icon-mqtt-disconnected',
-        iconSize: [16, 16], // increase from 12px to 16px to make hover easier
-    });
-
-    var iconOffline = L.divIcon({
-        className: 'icon-offline',
-        iconSize: [16, 16], // increase from 12px to 16px to make hover easier
-    });
-
     var iconPositionHistory = L.divIcon({
         className: 'icon-position-history',
         iconSize: [16, 16], // increase from 12px to 16px to make hover easier
     });
 
+    // ring colours used to distinguish nodes running non-default lora modem presets.
+    // the marker fill still indicates mqtt/online state (see icon-* css classes), while
+    // this coloured ring around the marker indicates the modem preset. long_fast (the
+    // de-facto default preset) and nodes with an unknown preset get no ring so that only
+    // nodes on "other" presets stand out.
+    var modemPresetRingColors = {
+        "LONG_SLOW": "#14b8a6",
+        "VERY_LONG_SLOW": "#0d9488",
+        "MEDIUM_SLOW": "#d946ef",
+        "MEDIUM_FAST": "#ec4899",
+        "SHORT_SLOW": "#0ea5e9",
+        "SHORT_FAST": "#06b6d4",
+        "LONG_MODERATE": "#eab308",
+        "SHORT_TURBO": "#f43f5e",
+        "LONG_TURBO": "#84cc16",
+        "LITE_FAST": "#22c55e",
+        "LITE_SLOW": "#65a30d",
+        "NARROW_FAST": "#fb923c",
+        "NARROW_SLOW": "#f97316",
+        "TINY_FAST": "#a78bfa",
+        "TINY_SLOW": "#7c3aed",
+        "MEDIUM_TURBO": "#f59e0b",
+    };
+
+    // tracks which modem presets are currently present on the map, so the legend can
+    // list only the presets that are actually in use.
+    var presentModemPresets = new Set();
+
+    // builds a leaflet divIcon for a node marker. the state class (icon-mqtt-connected,
+    // icon-mqtt-disconnected or icon-offline) sets the fill colour, and when the node is
+    // on a non-default modem preset we add a coloured ring to make it stand out. both
+    // plain and preset markers share the same 10px fill so they read as one family.
+    function createNodeDivIcon(stateClassName, modemPresetName) {
+        const ringColor = modemPresetName ? modemPresetRingColors[modemPresetName] : null;
+        // layered rings: white halo, optional coloured preset ring, then a thin grey
+        // hairline for contrast on light basemap tiles, plus a soft drop shadow.
+        const rings = ringColor
+            ? `0 0 0 2px #fff,0 0 0 5px ${ringColor},0 0 0 6px rgba(0,0,0,0.18)`
+            : `0 0 0 2px #fff,0 0 0 3px rgba(0,0,0,0.18)`;
+        return L.divIcon({
+            className: '',
+            iconSize: [16, 16],
+            html: `<div class="${stateClassName}" style="width:10px;height:10px;margin:3px;border:0;`
+                + `box-shadow:${rings},0 1px 3px rgba(0,0,0,0.4);"></div>`,
+        });
+    }
+
+    // Leaflet computes a tooltip's position from its container height at the moment
+    // it opens. Node tooltips contain a device image whose height only settles after
+    // it loads (or errors and collapses its margin), which shifts the vertical centre
+    // and leaves the pointer sitting off the marker on re-hover. Re-run the tooltip's
+    // position calc once each contained image settles so it stays centred on the marker.
+    function keepTooltipCenteredAfterImages(tooltip) {
+        if(!tooltip || !tooltip._container){
+            return;
+        }
+        tooltip._container.querySelectorAll('img').forEach(function(img){
+            if(img.dataset.recenterBound){
+                return;
+            }
+            img.dataset.recenterBound = '1';
+            var reposition = function(){
+                if(tooltip._map){
+                    tooltip._updatePosition();
+                    if(tooltip._adjustPan){
+                        tooltip._adjustPan();
+                    }
+                }
+            };
+            img.addEventListener('load', reposition);
+            img.addEventListener('error', reposition);
+        });
+    }
+
     // create legend
     var legendLayerGroup = new L.LayerGroup();
+    var legendDiv = null;
+
+    // builds the legend content, including a dynamic modem preset section that lists
+    // only the presets currently present on the map.
+    function buildLegendHtml() {
+        let html = `<div style="margin-bottom:6px;"><strong>Legend</strong></div>`
+            + `<div style="display:flex"><div class="icon-mqtt-connected" style="width:12px;height:12px;margin-right:4px;margin-top:auto;margin-bottom:auto;"></div> MQTT Connected</div>`
+            + `<div style="display:flex"><div class="icon-mqtt-disconnected" style="width:12px;height:12px;margin-right:4px;margin-top:auto;margin-bottom:auto;"></div> MQTT Disconnected</div>`
+            + `<div style="display:flex"><div class="icon-offline" style="width:12px;height:12px;margin-right:4px;margin-top:auto;margin-bottom:auto;"></div> Offline Too Long</div>`;
+
+        // list modem presets currently in use that have a ring colour assigned
+        const presets = Array.from(presentModemPresets)
+            .filter((preset) => modemPresetRingColors[preset])
+            .sort();
+        if(presets.length > 0){
+            html += `<div style="margin-top:8px;margin-bottom:4px;"><strong>Modem Presets</strong></div>`;
+            for(const preset of presets){
+                const color = modemPresetRingColors[preset];
+                html += `<div style="display:flex"><div style="width:12px;height:12px;border-radius:12px;box-sizing:border-box;border:3px solid ${color};margin-right:4px;margin-top:auto;margin-bottom:auto;"></div> ${preset}</div>`;
+            }
+        }
+
+        return html;
+    }
+
+    // refreshes the legend content in place if it is currently displayed
+    function refreshLegend() {
+        if(legendDiv){
+            legendDiv.innerHTML = buildLegendHtml();
+        }
+    }
+
     var legend = L.control({position: 'bottomleft'});
     legend.onAdd = function (map) {
         var div = L.DomUtil.create('div', 'leaflet-control');
@@ -2855,11 +2950,12 @@
         div.style.padding = '8px 12px';
         div.style.borderRadius = '0.75rem';
         div.style.boxShadow = '0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)';
-        div.innerHTML = `<div style="margin-bottom:6px;"><strong>Legend</strong></div>`
-            + `<div style="display:flex"><div class="icon-mqtt-connected" style="width:12px;height:12px;margin-right:4px;margin-top:auto;margin-bottom:auto;"></div> MQTT Connected</div>`
-            + `<div style="display:flex"><div class="icon-mqtt-disconnected" style="width:12px;height:12px;margin-right:4px;margin-top:auto;margin-bottom:auto;"></div> MQTT Disconnected</div>`
-            + `<div style="display:flex"><div class="icon-offline" style="width:12px;height:12px;margin-right:4px;margin-top:auto;margin-bottom:auto;"></div> Offline Too Long</div>`;
+        div.innerHTML = buildLegendHtml();
+        legendDiv = div;
         return div;
+    };
+    legend.onRemove = function () {
+        legendDiv = null;
     };
 
     // handle baselayerchange to update tile layer preference
@@ -3063,6 +3159,10 @@
         waypointsLayerGroup.clearLayers();
     }
 
+    // tracks the node whose clicked (permanent) tooltip is currently open, so the
+    // hover tooltip for the same node isn't shown stacked behind it.
+    var persistentTooltipNodeId = null;
+
     function closeAllPopups() {
         map.eachLayer(function(layer) {
             if(layer.options.pane === "popupPane"){
@@ -3072,6 +3172,7 @@
     }
 
     function closeAllTooltips() {
+        persistentTooltipNodeId = null;
         map.eachLayer(function(layer) {
             if(layer.options.pane === "tooltipPane"){
                 layer.removeFrom(map);
@@ -3451,6 +3552,9 @@
         // clear nodes cache
         nodes = [];
 
+        // clear tracked modem presets so the legend reflects the current node set
+        presentModemPresets.clear();
+
         // get config
         const now = moment();
         const configNodesMaxAgeInSeconds = getConfigNodesMaxAgeInSeconds();
@@ -3541,21 +3645,29 @@
             const markerLongitude = adjustedCoords.longitude;
 
             // icon based on mqtt connection state
-            var icon = iconMqttDisconnected;
+            var iconStateClassName = 'icon-mqtt-disconnected';
 
             // use offline icon for nodes older than configured node offline age
             if(configNodesOfflineAgeInSeconds){
                 const lastUpdatedAgeInMillis = now.diff(moment(node.updated_at));
                 if(lastUpdatedAgeInMillis > configNodesOfflineAgeInSeconds * 1000){
-                    icon = iconOffline;
+                    iconStateClassName = 'icon-offline';
                 }
             }
 
             // determine if node was recently heard uplinking packets to mqtt
             const nodeHasUplinkedToMqttRecently = hasNodeUplinkedToMqttRecently(node);
             if(nodeHasUplinkedToMqttRecently){
-                icon = iconMqttConnected;
+                iconStateClassName = 'icon-mqtt-connected';
             }
+
+            // track modem presets in use so the legend can list them
+            if(node.modem_preset_name && modemPresetRingColors[node.modem_preset_name]){
+                presentModemPresets.add(node.modem_preset_name);
+            }
+
+            // build the marker icon; fill = mqtt/online state, ring = modem preset
+            var icon = createNodeDivIcon(iconStateClassName, node.modem_preset_name);
 
             // create node marker
             const marker = L.marker([markerLatitude, markerLongitude], {
@@ -3585,6 +3697,16 @@
                 marker.bindTooltip(getTooltipContentForNode(node), {
                     interactive: true,
                 });
+                // don't stack the hover tooltip on top of the clicked (permanent)
+                // tooltip already showing for this same node
+                marker.on("tooltipopen", function(event){
+                    if(String(persistentTooltipNodeId) === String(event.target.options.tagName)){
+                        event.target.closeTooltip();
+                        return;
+                    }
+                    // keep the tooltip pointer on the marker after its image settles
+                    keepTooltipCenteredAfterImages(event.target.getTooltip());
+                });
             }
 
             // show node info tooltip when clicking node marker
@@ -3604,10 +3726,18 @@
                 showNodeOutline(node.node_id);
 
                 // open tooltip for node
-                map.openTooltip(getTooltipContentForNode(node), event.target.getLatLng(), {
+                const clickTooltip = L.tooltip({
                     interactive: true, // allow clicking buttons inside tooltip
                     permanent: true, // don't auto dismiss when clicking buttons inside tooltip
-                });
+                }).setContent(getTooltipContentForNode(node)).setLatLng(event.target.getLatLng());
+                map.openTooltip(clickTooltip);
+
+                // keep the tooltip pointer on the marker after its image settles
+                keepTooltipCenteredAfterImages(clickTooltip);
+
+                // remember which node has a persistent tooltip open so the hover
+                // tooltip doesn't reappear stacked behind it on mouse move
+                persistentTooltipNodeId = node.node_id;
 
             });
 
@@ -3615,6 +3745,9 @@
             nodeMarkers[node.node_id] = marker;
 
         }
+
+        // update the legend so it reflects the modem presets now on the map
+        refreshLegend();
 
         for(const node of updatedNodes){
 
